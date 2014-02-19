@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # -*- coding: UTF-8 -/-
-import evdev, phue, logging
+import logging, logging.handlers
 from evdev import ecodes, InputDevice 
 from phue import Bridge
 from datetime import datetime
@@ -12,81 +12,53 @@ LIGHT_GROUP = "Salon"
 LOG_LEVEL = logging.DEBUG
 
 class hueparam:
-  def __init__(self, name, maxi, multiplier, modulo=False):
+  def __init__(self, name, maxi, multiplier, modulo=False, mini = 0):
     self.name = str(name)
-    self.maxi = float(maxi)
-    self.multiplier = float(multiplier)
+    self.maxi = int(maxi)
+    self.multiplier = multiplier
+    self.last_update = datetime.now()
+    self.buff = 0
+    self.mini = int(mini)
     self.modulo = bool(modulo)
-    self.changed = False
-    self.last = None
-    self.buff = 0.0
 
   def __iadd__(self, val):
     """ add the device data taking into account max and modulo
     it also mark the hueparam as changed and register the datetime
     it has been changed
     """
-    self.buff += float(val) * self.multiplier
-    if modulo:
-      self.buff = self.buff % self.modulo
+    self.buff += int(val * self.multiplier)
+    if self.modulo:
+      self.buff = self.buff % self.maxi
     else:
       if self.buff > self.maxi:
         self.buff = self.maxi
-      elif self.buff < 0.0:
-    	self.buff = 0.0
-    self.last = datetime.now()
+      elif self.buff < self.mini:
+    	self.buff = self.mini
+    return self
 
 
-  def __reprr__(self):
-    """Return attributes as strigified dict without methods"""
-    return str(dict((key, getattr(self, key)) for key in dir(self) if key not in dir(self.__class__)))
-
-
-
-
-
-
-remote = InputDevice(TRACKPAD_DEVICE)
-remote.grab()
-hue = Bridge(BRIDGE_IP, API_USERNAME)
-logger = logging.getLogger("remote-hue")
-logger.setLevel(LOG_LEVEL)
-logfile = logging.FileHandler("/var/log/remote-hue.log")
-logformat = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-logfile.setFormatter(logformat)
-logger.addHandler(logfile)
-
-wheel_offset = 0
-x_offset = 0.0
-y_offset = 0.0
-hue_offset = 0
-sat_offset = 0
+  def __repr__(self):
+    """Return attributes as dict without methods"""
+    return dict((key, getattr(self, key)) for key in dir(self) if key not in dir(self.__class__))
+  def __str__(self):
+    """return name and """
+    return " ".join([self.name, ":", str(self.buff), "\t| last update :", str(self.last_update)]) 
 
 def switch_lights(hue):
   is_on = hue.get_group(LIGHT_GROUP, "on")
   hue.set_group(LIGHT_GROUP, "on", not(is_on))
 
-def change_brightness(hue, val):
-  global wheel_offset
-  wheel_offset += val * 4
-  
-  if (wheel_offset >= 20 or wheel_offset <= -20):
-    curr_bri = hue.get_group(LIGHT_GROUP, "bri")
-    new_bri = curr_bri + wheel_offset
-    if new_bri > 255:
-      new_bri = 255
-    if new_bri < 0:
-      new_bri = 0
-    
-    if curr_bri != new_bri:
-      logger.debug("Increase bri (" + str(curr_bri) + ") by " + str(wheel_offset))
-      #hue.set_group(LIGHT_GROUP, "bri", curr_bri + wheel_offset)
-      for i in [1,2,3]:
-        hue.set_light(i, "bri", new_bri)
-  
-  if not(-20 <= wheel_offset <= 20):
-    wheel_offset = 0  
- 
+def change_param(hue, param, val):
+  param += val
+  if (datetime.now() - param.last_update).microseconds > 100000:
+    curr_val = hue.get_group(LIGHT_GROUP, param.name)
+    if curr_val != param.buff:
+      logger.debug(param)
+      for i in range(1,4):
+	hue.set_light(i, param.name, param.buff)
+      param.last_update = datetime.now()
+      param.changed = False
+
 
 def change_cie(hue, val, code):
   global x_offset, y_offset
@@ -117,71 +89,51 @@ def change_cie(hue, val, code):
     x_offset = 0.0
     y_offset = 0.0
 
-def change_hue(hue, val):
-  global hue_offset
-  hue_offset += val * 20 
 
-  if (hue_offset >= 200) or (hue_offset <= -200):
-    curr_hue = hue.get_group(LIGHT_GROUP, "hue")
-    new_hue = (curr_hue + hue_offset) % 65535
-    if new_hue < 0:
-      new_hue += 65535
-    logger.debug("Change hue from " + str(curr_hue) + " to " + str(new_hue))
-    for i in [1,2,3]:
-      hue.set_light(i, "hue", new_hue)
+if __name__ == "__main__":
 
-  if not(-500 <= hue_offset <= 500):
-    hue_offset = 0
+  remote = InputDevice(TRACKPAD_DEVICE)
+  remote.grab()
+  hue = Bridge(BRIDGE_IP, API_USERNAME)
+  logger = logging.getLogger("hue-remote")
+  logger.setLevel(LOG_LEVEL)
+  logfile = logging.handlers.RotatingFileHandler("/var/log/hue-remote/hue-remote.log", maxBytes=50000, backupCount=2)
+  logformat = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+  logfile.setFormatter(logformat)
+  logger.addHandler(logfile)
 
-  
-def change_sat(hue, val):
-  global sat_offset
-  sat_offset += val
+  params = dict()
+  params["brightness"] = hueparam("bri", 255, 4)
+  params["hue"] = hueparam("hue", 65535, 20, modulo=True)
+  params["saturation"] = hueparam("sat", 255, 1)
+  #params["temperature"] = hueparam("ct", 500, 2, mini=153) 
+  #params["cie_x"] = hueparam("xy", 1.0, 0.001, isfloat=True)
+  #params["cie_y"] = hueparam("xy", 1.0, 0.001, isfloat=True)
 
-  if (sat_offset >= 20 or sat_offset <= -20):
-    curr_sat = hue.get_group(LIGHT_GROUP, "sat")
-    new_sat = curr_sat + sat_offset
-    if new_sat > 255:
-      new_sat = 255
-    if new_sat < 0:
-      new_sat = 0
-      
-    if new_sat != curr_sat:
-      logger.debug("Change sat from " + str(curr_sat) + " to " + str(new_sat))
-      #hue.set_group(LIGHT_GROUP, "bri", curr_bri + wheel_offset)
-      for i in [1,2,3]:
-        hue.set_light(i, "sat", new_sat)
-
-  if not(-20 <= sat_offset <= 20):
-    sat_offset = 0
-
-for event in remote.read_loop():
-  if event.type in [ecodes.EV_KEY, ecodes.EV_REL]:
-    if event.code == ecodes.BTN_RIGHT:
-      if event.value == 1:
-        logger.debug("BTN_RIGHT")
-        switch_lights(hue)
-    elif event.code == ecodes.BTN_LEFT:
-	    print("todo")
-    elif event.code == ecodes.BTN_SIDE: 
+  for event in remote.read_loop():
+    if event.type in [ecodes.EV_KEY, ecodes.EV_REL]:
+      if event.code == ecodes.BTN_RIGHT:
+        if event.value == 1:
+          logger.debug("BTN_RIGHT")
+          switch_lights(hue)
+      elif event.code == ecodes.BTN_LEFT:
+        print("todo")
+      elif event.code == ecodes.BTN_SIDE: 
       # 3 doigts de droite à gauche
-	    print("todo")
-    elif event.code == ecodes.BTN_EXTRA: 
+        print("todo")
+      elif event.code == ecodes.BTN_EXTRA: 
       # 3 doigts de gauche ) droite
-	    print("todo")
-    elif event.code == ecodes.KEY_PAGEUP: 
+        print("todo")
+      elif event.code == ecodes.KEY_PAGEUP: 
       # 3 doigts de bas en haut
-	    print("todo")
-    elif  event.code == ecodes.KEY_PAGEDOWN: 
+        print("todo")
+      elif  event.code == ecodes.KEY_PAGEDOWN: 
       # 3 doigts de haut en bas
-	    print("todo")
-    elif event.code == ecodes.REL_WHEEL: 
+        print("todo")
+      elif event.code == ecodes.REL_WHEEL: 
       # 2 doigt à la verticale
-      logger.debug("2 Doigt, Vertical, " + str(event.value) + " wheel_offset=" + str(wheel_offset))
-      change_brightness(hue, event.value)
-    #elif event.code in [ecodes.REL_Y, ecodes.REL_X] : # coordonnés X Y un doigt
-      #change_cie(hue, event.value, event.code)
-    elif event.code == ecodes.REL_Y:
-      change_sat(hue, event.value)
-    elif event.code == ecodes.REL_X:
-      change_hue(hue, event.value)  
+        change_param(hue, params["brightness"], event.value)
+      elif event.code == ecodes.REL_Y:
+        change_param(hue, params["saturation"], event.value)
+      elif event.code == ecodes.REL_X:
+        change_param(hue, params["hue"], event.value) 
