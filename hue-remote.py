@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # -*- coding: UTF-8 -/-
-import logging, logging.handlers, signal
+import logging, logging.handlers 
 from evdev import ecodes, InputDevice 
 from phue import Bridge
 from datetime import datetime
@@ -10,14 +10,14 @@ BRIDGE_IP = "192.168.0.11"
 API_USERNAME = "HueBTSwitch"
 LIGHT_GROUP = "Salon"
 LOG_LEVEL = logging.DEBUG
-
+REF_LIGHT = 2 # light used as referenced when initializing buffers for all lights
 class hueparam:
-    def __init__(self, name, maxi, multiplier, modulo=False, mini = 0):
+    def __init__(self, hue, name, maxi, multiplier, modulo=False, mini = 0):
         self.name = str(name)
         self.maxi = int(maxi)
         self.multiplier = multiplier
         self.last_update = datetime.now()
-        self.buff = 0
+        self.buff = hue.get_light(REF_LIGHT, name)
         self.mini = int(mini)
         self.modulo = bool(modulo)
 
@@ -30,10 +30,10 @@ class hueparam:
         if self.modulo:
             self.buff = self.buff % self.maxi
         else:
-        if self.buff > self.maxi:
-            self.buff = self.maxi
-        elif self.buff < self.mini:
-    	    self.buff = self.mini
+            if self.buff > self.maxi:
+                self.buff = self.maxi
+            elif self.buff < self.mini:
+    	        self.buff = self.mini
         return self
 
     def __repr__(self):
@@ -46,12 +46,16 @@ class hueparam:
 
 
 
-def switch_lights(hue):
-    """Switch all lights on if they are off, and vice versa"""
-    is_on = hue.get_group(LIGHT_GROUP, "on")
-    hue.set_group(LIGHT_GROUP, "on", not(is_on))
+def switch_lights(hue, state):
+    """Switch state lights on if they are off, and vice versa"""
+    light_index = REF_LIGHT if state == 0 else state
+    lights = [state] if state != 0 else all_lights(hue)
+    is_on = hue.get_light(light_index, "on")
 
-def change_param(hue, param, val):
+    for l in lights:
+        hue.set_light(l, "on", not(is_on))
+
+def change_param(hue, param, val, state):
     """Change a specific parameter of the lamps
     I'm delaying the update frequency as the device sends input much more
     rapidly than the Philips Hue api is able to handle
@@ -64,21 +68,27 @@ def change_param(hue, param, val):
     """
     param += val
     if (datetime.now() - param.last_update).microseconds > 100000:
-        curr_val = hue.get_light(2, param.name)
+        if state == 0: # all lights
+            curr_val = hue.get_light(REF_LIGHT, param.name) 
+        else:
+            curr_val = hue.get_light(state, param.name)
         if curr_val != param.buff:
             logger.debug(param)
-            for i in range(1,4):
+            lights = [state] if state != 0 else all_lights(hue)
+            for i in lights:
 	            hue.set_light(i, param.name, param.buff)
             param.last_update = datetime.now()
 
+def all_lights(hue):
+    return range(1, len(hue.lights) + 1)
 
-def change_theme(hue, themes, index):
+def change_theme(hue, params, themes, theme_indexi, state):
     theme_name = themes.keys()[theme_index]
     th = themes[theme_name]
     size = len(th)
-    logger.debug("***Changing theme to " + theme_name + "***")
-
-    for i in [1,2,3]:
+    logger.debug("Changing theme to " + theme_name)
+    
+    for i in all_lights(hue):
         lamp_th = th[i % size]
         if lamp_th.has_key("xy"):
             hue.set_light(i, "xy", [lamp_th["xy"][0], lamp_th["xy"][1]])
@@ -88,11 +98,39 @@ def change_theme(hue, themes, index):
             hue.set_light(i, "hue", lamp_th["hue"])
         if lamp_th.has_key("sat"):
             hue.set_light(i, "sat", lamp_th["sat"])
+    
+    for p in ["hue", "saturation"]:
+        params[p].buffer = hue.get_light(REF_LIGHT, params[p].name)
+    return change_state(hue, params, state, reset=True)
 
+def change_state(hue, params, state, reset=False):
+    """Change the current lamp being controlled and reset buffers
+    by default, state = 0 which means "control every lamps at once"
+    but using change_state goes to lamp 1, then 2...and loop back to all lamps
 
+    if reset is True then the state is reseting to all lamps and buffers are
+    reset to REF_LIGHT values
+    """
+    state = (state + 1) % (len(hue.lights) + 1)
+    if reset:
+        state = 0
+        logger.debug("Reseting state to 0")
+        light_index = REF_LIGHT
+    else:
+        logger.debug("Changing state to : " + str(state))
+        if state == 0:
+            hue.set_group("all", "alert", "select")
+            light_index = REF_LIGHT
+        else:
+            hue.set_light(state, "alert", "select")
+            light_index = state
+
+    for p in params.keys(): # reseting buffers
+        params[p].buffer = hue.get_light(light_index, params[p].name) 
+
+    return state
 
 if __name__ == "__main__":
-
     remote = InputDevice(TRACKPAD_DEVICE)
     remote.grab()
     hue = Bridge(BRIDGE_IP, API_USERNAME)
@@ -102,6 +140,10 @@ if __name__ == "__main__":
     logformat = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
     logfile.setFormatter(logformat)
     logger.addHandler(logfile)
+    
+    curr_state = 0
+    last_click = None # used to handle double click
+    new_click = None
 
     themes = dict()
     themes["relax"] = [{"ct": 2431}]
@@ -116,28 +158,41 @@ if __name__ == "__main__":
     theme_index = 0
 
     params = dict()
-    params["brightness"] = hueparam("bri", 255, 4)
-    params["hue"] = hueparam("hue", 65535, 20, modulo=True)
-    params["saturation"] = hueparam("sat", 255, 1)
+    params["brightness"] = hueparam(hue, "bri", 255, 4)
+    params["hue"] = hueparam(hue, "hue", 65535, 20, modulo=True)
+    params["saturation"] = hueparam(hue, "sat", 255, 1)
     #params["temperature"] = hueparam("ct", 500, 2, mini=153) 
     #params["cie_x"] = hueparam("xy", 1.0, 0.001, isfloat=True)
     #params["cie_y"] = hueparam("xy", 1.0, 0.001, isfloat=True)
+    
 
     for event in remote.read_loop():
         if event.type in [ecodes.EV_KEY, ecodes.EV_REL]:
+            last_click = new_click if new_click != None else datetime.now()
+            new_click = datetime.now()
+
+            if (new_click - last_click).total_seconds() > 5.0 and curr_state != 0:
+                curr_state = change_state(hue, params, curr_state, reset=True) 
+
             if event.code == ecodes.BTN_RIGHT and event.value == 1:
                 logger.debug("Switching lights")
-                switch_lights(hue)
-            elif event.code == ecodes.BTN_LEFT:
-                print("todo")
+                switch_lights(hue, curr_state)
+            elif event.code == ecodes.BTN_LEFT and event.value == 1:
+            # If you wonder why i'm doing double click here, it is
+            # because my touchpad is bugged and sometimes do a left
+            # click for NO REASON, that's also why i'm not using the
+            # left click for switching lights
+                if (new_click - last_click).total_seconds() < 0.5:
+                    curr_state = change_state(hue, params, curr_state)
+                    
             elif event.code == ecodes.BTN_SIDE and event.value == 1: 
             # 3 doigts de droite à gauche
                 theme_index = (theme_index - 1) % len(themes)
-                change_theme(hue, themes, theme_index)
+                curr_state = change_theme(hue, params, themes, theme_index, curr_state)
             elif event.code == ecodes.BTN_EXTRA and event.value == 1: 
             # 3 doigts de gauche ) droite
                 theme_index = (theme_index + 1) % len(themes)
-                change_theme(hue, themes, theme_index)
+                curr_state = change_theme(hue, params, themes, theme_index, curr_state)
             elif event.code == ecodes.KEY_PAGEUP: 
             # 3 doigts de bas en haut
                 print("todo")
@@ -146,8 +201,8 @@ if __name__ == "__main__":
                 print("todo")
             elif event.code == ecodes.REL_WHEEL: 
             # 2 doigt à la verticale
-                change_param(hue, params["brightness"], event.value)
+                change_param(hue, params["brightness"], event.value, curr_state)
             elif event.code == ecodes.REL_Y:
-                change_param(hue, params["saturation"], event.value)
+                change_param(hue, params["saturation"], event.value, curr_state)
             elif event.code == ecodes.REL_X:
-                change_param(hue, params["hue"], event.value) 
+                change_param(hue, params["hue"], event.value, curr_state) 
